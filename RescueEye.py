@@ -1,101 +1,133 @@
 import time
-import spidev
-import Adafruit_DHT
+import board
+import busio
+import digitalio
 import RPi.GPIO as GPIO
+import adafruit_dht
+from adafruit_mcp3xxx.mcp3008 import MCP3008
+from adafruit_mcp3xxx.analog_in import AnalogIn
 from Adafruit_IO import Client
 
-# ======================
-# ADAFRUIT IO SETTINGS
-# ======================
-ADAFRUIT_IO_USERNAME = "YOUR_USERNAME"
-ADAFRUIT_IO_KEY = "YOUR_AIO_KEY"
+
+# ADAFRUIT IO CONFIG
+ADAFRUIT_IO_USERNAME = "User"
+ADAFRUIT_IO_KEY = "Key"
 
 aio = Client(ADAFRUIT_IO_USERNAME, ADAFRUIT_IO_KEY)
 
-# Feed names (create later)
+# Feed names
+FEED_RISK = "risk-status"
 FEED_TEMP = "temperature"
-FEED_HUMIDITY = "humidity"
-FEED_OXYGEN = "oxygen-level"
-FEED_STATUS = "risk-status"
+FEED_HUM = "humidity"
+FEED_OXY = "oxygen"
 
-# ======================
+
 # GPIO SETUP
-# ======================
+LED_PIN = 18
 GPIO.setmode(GPIO.BCM)
+GPIO.setup(LED_PIN, GPIO.OUT)
 
-RED_LED = 18   # PWM pin
-GPIO.setup(RED_LED, GPIO.OUT)
-red_pwm = GPIO.PWM(RED_LED, 1000)
-red_pwm.start(0)
+led_pwm = GPIO.PWM(LED_PIN, 100)
+led_pwm.start(0)
 
-# ======================
+
 # DHT11 SETUP
-# ======================
-DHT_SENSOR = Adafruit_DHT.DHT11
-DHT_PIN = 21
+dht = adafruit_dht.DHT11(board.D21)
 
-# ======================
-# MCP3008 SETUP
-# ======================
-spi = spidev.SpiDev()
-spi.open(0, 0)  # SPI0, CE0
-spi.max_speed_hz = 1350000
 
-def read_adc(channel):
-    adc = spi.xfer2([1, (8 + channel) << 4, 0])
-    data = ((adc[1] & 3) << 8) | adc[2]
-    return data  # 0 - 1023
+# MCP3008 ADC SETUP
+spi = busio.SPI(clock=board.SCK,
+                MISO=board.MISO,
+                MOSI=board.MOSI)
 
-# ======================
+cs = digitalio.DigitalInOut(board.D8)  # CE0
+mcp = MCP3008(spi, cs)
+
+potentiometer = AnalogIn(mcp, MCP3008.P1)  # CH1
+
+
+# CLASSIFICATION FUNCTIONS
+def classify_oxygen(value):
+    if value <= 340:
+        return "SAFE"
+    elif value <= 680:
+        return "CAUTION"
+    else:
+        return "DANGER"
+
+def classify_temperature(temp):
+    if temp <= 35:
+        return "SAFE"
+    elif temp <= 50:
+        return "CAUTION"
+    else:
+        return "DANGER"
+
+def classify_humidity(hum):
+    if hum <= 70:
+        return "SAFE"
+    elif hum <= 85:
+        return "CAUTION"
+    else:
+        return "DANGER"
+
+def overall_risk(statuses):
+    if "DANGER" in statuses:
+        return "DANGER"
+    elif "CAUTION" in statuses:
+        return "CAUTION"
+    else:
+        return "SAFE"
+
+
 # MAIN LOOP
-# ======================
 try:
     while True:
-        # Read sensors
-        humidity, temperature = Adafruit_DHT.read(DHT_SENSOR, DHT_PIN)
-        oxygen_sim = read_adc(1)  # Potentiometer on CH1
+        try:
+            # Read sensors
+            oxygen_value = potentiometer.value >> 6  # Scale to 0–1023
+            temperature = dht.temperature
+            humidity = dht.humidity
 
-        if humidity is None or temperature is None:
-            print("Failed to read DHT sensor")
-            time.sleep(2)
-            continue
+            # Classify each
+            oxy_status = classify_oxygen(oxygen_value)
+            temp_status = classify_temperature(temperature)
+            hum_status = classify_humidity(humidity)
 
-        # ------------------
-        # RISK LOGIC
-        # ------------------
-        status = "SAFE"
-        pwm_level = 0
+            final_status = overall_risk(
+                [oxy_status, temp_status, hum_status]
+            )
 
-        if oxygen_sim < 300 or temperature > 45:
-            status = "DANGER"
-            pwm_level = 100
-        elif oxygen_sim < 500 or temperature > 35:
-            status = "CAUTION"
-            pwm_level = 30
+            # LED behaviour
+            if final_status == "SAFE":
+                led_pwm.ChangeDutyCycle(0)
+            elif final_status == "CAUTION":
+                led_pwm.ChangeDutyCycle(30)
+            else:
+                led_pwm.ChangeDutyCycle(100)
 
-        red_pwm.ChangeDutyCycle(pwm_level)
+            # Terminal output
+            print("----------------------------")
+            print(f"Oxygen ADC : {oxygen_value} → {oxy_status}")
+            print(f"Temp (°C)  : {temperature} → {temp_status}")
+            print(f"Humidity % : {humidity} → {hum_status}")
+            print(f"OVERALL    : {final_status}")
+            print("----------------------------")
 
-        # ------------------
-        # TERMINAL OUTPUT
-        # ------------------
-        print("Temp:", temperature, "°C")
-        print("Humidity:", humidity, "%")
-        print("Oxygen(sim):", oxygen_sim)
-        print("STATUS:", status)
-        print("-" * 30)
+            # Send to Adafruit IO
+            aio.send(FEED_OXY, oxygen_value)
+            aio.send(FEED_TEMP, temperature)
+            aio.send(FEED_HUM, humidity)
+            aio.send(FEED_RISK, final_status)
 
-        # ------------------
-        # SEND TO ADAFRUIT
-        # ------------------
-        aio.send(FEED_TEMP, temperature)
-        aio.send(FEED_HUMIDITY, humidity)
-        aio.send(FEED_OXYGEN, oxygen_sim)
-        aio.send(FEED_STATUS, status)
+        except RuntimeError as error:
+            print("Sensor read error:", error)
 
         time.sleep(5)
 
 except KeyboardInterrupt:
-    print("Exiting...")
-    red_pwm.stop()
+    print("Program stopped")
+
+finally:
+    led_pwm.stop()
     GPIO.cleanup()
-    spi.close()
