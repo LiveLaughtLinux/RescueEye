@@ -1,58 +1,51 @@
 import time
 import board
-import busio
-import digitalio
 import RPi.GPIO as GPIO
 import adafruit_dht
-from adafruit_mcp3xxx.mcp3008 import MCP3008
-from adafruit_mcp3xxx.analog_in import AnalogIn
+import spidev
 from Adafruit_IO import Client
 
-
-# ADAFRUIT IO CONFIG
+# --- Adafruit IO setup ---
 ADAFRUIT_IO_USERNAME = "User"
 ADAFRUIT_IO_KEY = "Key"
-
 aio = Client(ADAFRUIT_IO_USERNAME, ADAFRUIT_IO_KEY)
 
-# Feed names
 FEED_RISK = "risk-status"
 FEED_TEMP = "temperature"
 FEED_HUM = "humidity"
 FEED_OXY = "oxygen"
+FEED_LDR = "light"
 
-
-# GPIO SETUP
+# --- GPIO setup ---
 LED_PIN = 18
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(LED_PIN, GPIO.OUT)
-
 led_pwm = GPIO.PWM(LED_PIN, 100)
 led_pwm.start(0)
 
-
-# DHT11 SETUP
+# --- DHT11 setup ---
 dht = adafruit_dht.DHT11(board.D21)
 
+# --- SPI setup for MCP3008 ---
+spi = spidev.SpiDev()
+spi.open(0, 0)  # bus 0, device 0 (CE0)
+spi.max_speed_hz = 1350000
 
-# MCP3008 ADC SETUP
-spi = busio.SPI(clock=board.SCK,
-                MISO=board.MISO,
-                MOSI=board.MOSI)
+def readadc(adcnum):
+    """Read SPI data from MCP3008 channel (0–7)."""
+    if adcnum > 7 or adcnum < 0:
+        return -1
+    r = spi.xfer2([1, (8 + adcnum) << 4, 0])
+    data = ((r[1] & 3) << 8) + r[2]
+    return data
 
-cs = digitalio.DigitalInOut(board.D8)  # CE0
-mcp = MCP3008(spi, cs)
-
-potentiometer = AnalogIn(mcp, MCP3008.P1)  # CH1
-
-
-# CLASSIFICATION FUNCTIONS
+# --- Classification functions ---
 def classify_oxygen(value):
-    if value <= 340:
+    if value <= 33:      # 0–33% safe
         return "SAFE"
-    elif value <= 680:
+    elif value <= 66:    # 34–66% caution
         return "CAUTION"
-    else:
+    else:                # 67–100% danger
         return "DANGER"
 
 def classify_temperature(temp):
@@ -79,24 +72,26 @@ def overall_risk(statuses):
     else:
         return "SAFE"
 
-
-# MAIN LOOP
+# --- Main loop ---
 try:
     while True:
         try:
             # Read sensors
-            oxygen_value = potentiometer.value >> 6  # Scale to 0–1023
+            ldr_value = readadc(0)       # CH0 = LDR raw value
+            oxygen_raw = readadc(1)      # CH1 = potentiometer raw value
+            oxygen_value = round((oxygen_raw / 1023) * 100, 2)  # convert to 0–100 %
+
             temperature = dht.temperature
             humidity = dht.humidity
+            if humidity is not None:
+                humidity = min(max(humidity, 0), 100)  # clamp to 0–100
 
             # Classify each
             oxy_status = classify_oxygen(oxygen_value)
             temp_status = classify_temperature(temperature)
             hum_status = classify_humidity(humidity)
 
-            final_status = overall_risk(
-                [oxy_status, temp_status, hum_status]
-            )
+            final_status = overall_risk([oxy_status, temp_status, hum_status])
 
             # LED behaviour
             if final_status == "SAFE":
@@ -108,13 +103,15 @@ try:
 
             # Terminal output
             print("----------------------------")
-            print(f"Oxygen ADC : {oxygen_value} → {oxy_status}")
-            print(f"Temp (°C)  : {temperature} → {temp_status}")
-            print(f"Humidity % : {humidity} → {hum_status}")
-            print(f"OVERALL    : {final_status}")
+            print(f"LDR (CH0)   : {ldr_value}")
+            print(f"Oxygen (CH1): {oxygen_value}% → {oxy_status}")
+            print(f"Temp (°C)   : {temperature} → {temp_status}")
+            print(f"Humidity %  : {humidity} → {hum_status}")
+            print(f"OVERALL     : {final_status}")
             print("----------------------------")
 
             # Send to Adafruit IO
+            aio.send(FEED_LDR, ldr_value)
             aio.send(FEED_OXY, oxygen_value)
             aio.send(FEED_TEMP, temperature)
             aio.send(FEED_HUM, humidity)
@@ -131,3 +128,5 @@ except KeyboardInterrupt:
 finally:
     led_pwm.stop()
     GPIO.cleanup()
+    spi.close()
+
